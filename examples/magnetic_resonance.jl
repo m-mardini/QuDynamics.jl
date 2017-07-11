@@ -283,8 +283,6 @@ function operator(sys::System, opspec::Vector{Int}, operator_type::String="comm"
         ist = irr_sph(mult(sys.isotopes[k]), l)
         answer = kron(answer, ist[l-m+1].coeffs)
     end
-    @show answer
-    @show b
     answer = QuArray(answer, (b,b))
     if sys.formalism == "Liouville"
         answer = hilb2liouv(sys, answer, operator_type)
@@ -292,8 +290,69 @@ function operator(sys::System, opspec::Vector{Int}, operator_type::String="comm"
     answer
 end
 
+# easier specification with labels rather than numbers
+function operator(sys::System, operators::Vector{String}, spins::Vector{Int}, operator_type::String="comm")
+    opspec = fill(0, length(sys.isotopes))
+    coeff = 1
+    for idx=1:length(operators)
+        if operators[idx] == "L+"
+            coeff *= -sqrt(2)
+            opspec[spins[idx]] = 1
+        elseif operators[idx] == "Lz"
+            coeff *= 1
+            opspec[spins[idx]] = 2
+        elseif operators[idx] == "L-"
+            coeff *= sqrt(2)
+            opspec[spins[idx]] = 3
+        else
+            r = match(r"T([\+\-]?\d+),([\+\-]?\d+)", operators[idx])
+            if r != nothing
+                (l,m) = map(x->parse(Int,x), r.captures)
+                opspec[spins[idx]] = l^2 + l - m
+                coeff = 1*coeff
+            else
+                error("unrecognized operator specification: $(operators[idx])")
+            end
+        end
+    end
+    coeff * operator(sys, opspec, operator_type)
+end
+
+# easy way to specify an operator for all spins of some isotope
+function operator(sys::System, op::String, spins::String, operator_type::String="comm")
+    matching = find([isotope.label == spins for isotope in sys.isotopes])
+    @parallel (+) for n in matching
+        operator(sys, [op], [n], operator_type)
+    end
+end
+
+# generate the unit state
+# identity matrix if Hilbert
+# stretched identity matrix if Liouville
+function unit_state(sys::System)
+    b = basis(sys)
+    rho = QuArray(speye(length(b)), (b,b))
+    if sys.formalism == "Liouville"
+        rho = hilb2liouv(sys, rho, "statevec")
+        rho = rho/norm(rho.coeffs,2)
+    end
+    rho
+end
+
 # get the state with some specification
+# returns a matrix in Hilbert space (density matrix)
+# or a vector in Liouville space
+# basic method is similar to operator
+function state(sys::System, opspec::Vector{Int})
+    operator(sys, opspec, "left") * unit_state(sys)
+end
+
+function state(sys::System, ops, spins)
+    operator(sys, ops, spins, "left") * unit_state(sys)
+end
 
 # compute contribution to hamiltonian from a Zeeman coupling
 # return the spinach style 1,9,25 matrices describing behavior of term
 # under all kinds of rotations
+function hamiltonian(sys::System, z::Zeeman)
+    
