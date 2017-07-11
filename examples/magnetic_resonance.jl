@@ -65,10 +65,14 @@ function spin(x::Isotope)
     QuBase.spin(x.spin)
 end
 
+function mult(x::Isotope)
+    Int(2*QuBase.spin_value(spin(x))+1)
+end
+
 # a type for a particular Zeeman coupling
 # we need it to be mutable so we can change the strength flag
 # it contains the label of the spin as well
-mutable struct Zeeman{T<:Real} <: AbstractMatrix{T}
+mutable struct Zeeman{T<:Real}
     spin::Int
     matrix::Array{T,2}          # csa tensor
     strength::String            # flag for keeping labframe, secular, etc.
@@ -83,9 +87,6 @@ end
 function getindex(x::Zeeman, values...)
     getindex(x.matrix, values...)
 end
-
-promote_rule{T<:AbstractMatrix}(::Type{T}, ::Type{Zeeman}) = T
-convert{T<:AbstractMatrix}(::Type{T}, x::Zeeman) = convert(T, x.matrix)
 
 # ZYZ convention (copied from Spinach)
 function euler2dcm{T<:Real}(a::T, b::T, g::T)
@@ -123,16 +124,13 @@ function Zeeman(spin::Int, iso, aniso, eta, euler::Vector, strength::String="")
     Zeeman(spin, eigs, euler, strength)
 end
 
-mutable struct Coord{T<:Real} <: AbstractVector{T}
+mutable struct Coord{T<:Real}
     spin::Int
     pos::Vector{T}
     function Coord(spin::Int, pos::Vector{T}) where {T<:Real}
         new{T}(spin, pos)
     end
 end
-
-promote_rule{T<:AbstractVector}(::Type{T}, ::Type{Coord}) = T
-convert{T<:AbstractVector}(::Type{T}, x::Coord) = convert(T, x.pos)
 
 function size(x::Coord)
     size(x.pos)
@@ -183,25 +181,119 @@ mutable struct System{T<:Real}
     System{T}() where T = new(0,[],[],[],[],"Liouville")
 end
 
+# modifies z and returns ddscal
+function ddscal!(iso::Isotope, z::Zeeman, magnet::T where {T<:Real})
+    freeg = 2.0023193043622
+    if iso.label=="E"
+        answer = z.matrix / freeg
+        z.matrix = z.matrix * (-magnet * iso.gamma) / freeg
+    else
+        answer = eye(3) + (z.matrix * 1e-6)
+        z.matrix = (eye(3) + (z.matrix * 1e-6)) * (-magnet * iso.gamma)
+    end
+    answer
+end
+
+# compute dipolar coupling between two spins
+# meant for use as part of another function which will iterate through coords
+# include the appropriate ddscal values
+function dipolar(iso1::Isotope, iso2::Isotope, c1::Coord, c2::Coord, dscal1::Array{Float64,2}, dscal2::Array{Float64, 2})
+    distvect = c2.pos - c1.pos
+    distance = norm(distvect)
+    ort = distvect/distance
+    hbar  = 1.054571628e-34
+    mu0   = pi*4e-7
+    d = iso1.gamma * iso2.gamma * hbar * mu0 / (4*pi*(dist*1e-10)^3)
+    mat = d * [1-3*ort[1]*ort[1]    -3*ort[1]*ort[2]   -3*ort[1]*ort[3];
+               -3*ort[2]*ort[1]   1-3*ort[2]*ort[2]   -3*ort[2]*ort[3];
+               -3*ort[3]*ort[1]    -3*ort[3]*ort[2]  1-3*ort[3]*ort[3]]
+    mat = dscal1' * mat * dscal2
+    mat = mat - (eye(3)*trace(mat)/3)
+    mat = (mat + mat')/2
+    Coupling((c1.spin, c2.spin), mat, "")
+end
+
 # construct a label basis for the system.
 # in Hilbert space, we'll use a simple basis of z states
 # in Liouville space, we'll use irreducible spherical tensors
 # if dimensionality is n in Hilbert, it's n^2 in Liouville
 function basis(sys::System)
-    mults = map(x->Int(2*QuBase.spin_value(spin(x))+1), sys.isotopes)
-    if sys.formalism == "Hilbert"
-        b = QuBase.LabelBasis(mults...)
-    elseif sys.formalism == "Liouville"
-        b = QuBase.LabelBasis((mults.^2)...)
+    mults = map(mult, sys.isotopes)
+    QuBase.LabelBasis(mults...)
+end
+
+function liouv_basis(sys::System)
+    mults = map(mult, sys.isotopes)
+    QuBase.LabelBasis((mults.^2)...)
+end
+
+function hilb2liouv(sys::System, x::QuArray, operator_type::String)
+    h = QuBase.rawcoeffs(x)
+    lb = liouv_basis(sys)
+    unit = speye(size(h)...)
+    if operator_type == "comm"
+        l = kron(unit, h) - kron(transpose(h), unit)
+        btup = (lb,lb)
+    elseif operator_type == "acomm"
+        l = kron(unit, h) + kron(transpose(h), unit)
+        btup = (lb,lb)
+    elseif operator_type == "left"
+        l = kron(unit, h)
+        btup = (lb,lb)
+    elseif operator_type == "right"
+        l = kron(transpose(h), unit)
+        btup = (lb,lb)
+    elseif operator_type == "statevec"
+        l = h[:]
+        btup = (lb)
     end
-    b
+    QuArray(l, btup)
+end
+
+# get the rank k spherical tensor operators corresponding to a
+# particular spin multiplicity
+# also translated from Spinach
+function irr_sph(mult::Int, k::Int)
+    if k>0
+        p = spinjp((mult-1)/2)
+        m = spinjm((mult-1)/2)
+        T = Vector{typeof(p)}(2*k+1)
+        T[1] = ((-1)^k)*(2^(-k/2))*p^k
+        for n=2:(2*k+1)
+            q = k-n+2
+            T[n] = (1/sqrt((k+q)*(k-q+1)))*(m*T[n-1]-T[n-1]*m)
+        end
+    elseif k==0
+        T = [QuArray(speye(mult))]
+    end
+    T
 end
 
 # get the operator corresponding to some specification
+# base form: supply a Vector{Int} with a # for the spherical tensor
+# operator on each spin
+# 0 = unit, 1 = T(1,1) = -sqrt(2)*I+, 2 = T(1,0) = Iz, 3 = T(1,-1) = sqrt(2)*I-
+# and so on
+function operator(sys::System, opspec::Vector{Int}, operator_type::String="comm")
+    b = basis(sys)
+    answer = 1
+    for k=1:length(opspec)
+        l = trunc(Int, sqrt(opspec[k]))
+        m = l^2 + l - opspec[k]
+        ist = irr_sph(mult(sys.isotopes[k]), l)
+        answer = kron(answer, ist[l-m+1].coeffs)
+    end
+    @show answer
+    @show b
+    answer = QuArray(answer, (b,b))
+    if sys.formalism == "Liouville"
+        answer = hilb2liouv(sys, answer, operator_type)
+    end
+    answer
+end
 
 # get the state with some specification
 
 # compute contribution to hamiltonian from a Zeeman coupling
 # return the spinach style 1,9,25 matrices describing behavior of term
 # under all kinds of rotations
-    
