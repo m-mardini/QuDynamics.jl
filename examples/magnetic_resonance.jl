@@ -351,8 +351,54 @@ function state(sys::System, ops, spins)
     operator(sys, ops, spins, "left") * unit_state(sys)
 end
 
+# helper function, decide if something is significant
+# user supplies the value and the tolerance to check it against
+# list of tolerances defined in the function
+function significant{T<:Number}(num::T, tol_string::String)
+    if tol_string == "inter_cutoff"
+        tol = 1e-10
+    end
+
+    if abs(num) >= tol
+        return true
+    else
+        return false
+    end
+end
+
 # compute contribution to hamiltonian from a Zeeman coupling
-# return the spinach style 1,9,25 matrices describing behavior of term
-# under all kinds of rotations
+# write a general descriptor which can be interpreted to the actual Hamiltonian
 function hamiltonian(sys::System, z::Zeeman)
-    
+    nL = 0
+    opL = fill("E", 8)
+    nS = 0
+    opS = fill("E",8)
+    isotropic = zeros(Float64, 8)
+    ist_coeff = zeros(Float64, 8, 5)
+    irr_comp = zeros(Float64, 8, 5)
+
+    # isotropic part
+    if z.strength in ["full", "z_full"]
+
+        # keep the carrier
+        zeeman_iso = trace(z.matrix)/3
+
+        if significant(zeeman_iso, "inter_cutoff")
+            nL = n, opL[2] = "Lz"
+            isotropic[2] = zeeman_iso
+        end
+
+    elseif z.strength in ["secular", "z_offs"]
+
+        # subtract the carrier
+        zeeman_iso = trace(z.matrix)/3 - (-sys.magnet * (sys.isotopes[z.spin]).gamma)
+        if significant(zeeman_iso, "inter_cutoff")
+            nL = n; opL[2] = "Lz"
+            isotropic[2] = zeeman_iso
+        end
+
+    end
+
+    # anisotropic part
+
+end
