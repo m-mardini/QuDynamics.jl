@@ -7,7 +7,8 @@ Base.length,
 Base.size,
 Base.getindex,
 Base.promote_rule,
-Base.convert
+Base.convert,
+Base.zeros
 
 """
 A library of spin values (S = j/2) and gyromagnetic ratios (rad/s).
@@ -203,14 +204,14 @@ function dipolar(iso1::Isotope, iso2::Isotope, c1::Coord, c2::Coord, dscal1::Arr
     ort = distvect/distance
     hbar  = 1.054571628e-34
     mu0   = pi*4e-7
-    d = iso1.gamma * iso2.gamma * hbar * mu0 / (4*pi*(dist*1e-10)^3)
+    d = iso1.gamma * iso2.gamma * hbar * mu0 / (4*pi*(distance*1e-10)^3)
     mat = d * [1-3*ort[1]*ort[1]    -3*ort[1]*ort[2]   -3*ort[1]*ort[3];
                -3*ort[2]*ort[1]   1-3*ort[2]*ort[2]   -3*ort[2]*ort[3];
                -3*ort[3]*ort[1]    -3*ort[3]*ort[2]  1-3*ort[3]*ort[3]]
     mat = dscal1' * mat * dscal2
     mat = mat - (eye(3)*trace(mat)/3)
     mat = (mat + mat')/2
-    Coupling((c1.spin, c2.spin), mat, "")
+    Coupling{eltype(mat)}((c1.spin, c2.spin), mat, "")
 end
 
 # construct a label basis for the system.
@@ -248,6 +249,16 @@ function hilb2liouv(sys::System, x::QuArray, operator_type::String)
         btup = (lb)
     end
     QuArray(l, btup)
+end
+
+function zeros(sys::System)
+    b = basis(sys)
+    m = length(b)
+    answer = QuArray(spzeros(m,m), (b,b))
+    if sys.formalism == "Liouville"
+        answer = hilb2liouv(sys, answer, "left")
+    end
+    answer
 end
 
 # get the rank k spherical tensor operators corresponding to a
@@ -354,28 +365,83 @@ end
 # helper function, decide if something is significant
 # user supplies the value and the tolerance to check it against
 # list of tolerances defined in the function
-function significant{T<:Number}(num::T, tol_string::String)
+function significant(num, tol_string::String)
     if tol_string == "inter_cutoff"
         tol = 1e-10
     end
 
-    if abs(num) >= tol
+    if norm(num) >= tol
         return true
     else
         return false
     end
 end
 
+# generic descriptor for a single term in the Hamiltonian
+# specifies a product operator involving up to two spins
+# and the isotropic (rank 0) and anisotropic (rank 2, five components)
+immutable Descriptor
+    nL::Int
+    nS::Int
+    opL::String
+    opS::String
+    isotropic::Float64
+    ist_coeff::Vector{Float64}
+    irr_comp::Vector{Float64}
+end
+
+function hamiltonian(sys::System, d::Descriptor, operator_type::String="comm")
+
+    if d.nS == 0
+        oper = operator(sys, [d.opL], [d.nL], operator_type)
+    else
+        oper = operator(sys, [d.opL,d.opS], [d.nL,d.nS], operator_type)
+    end
+
+    H = zeros(sys)
+    if significant(d.isotropic, "inter_cutoff")
+        H = d.isotropic * oper
+    end
+
+    Q1 = fill(zeros(sys), 3,3)
+    Q2 = fill(zeros(sys), 5,5)
+
+    for m=1:5, k=1:5
+        if significant(d.ist_coeff[k]*d.irr_comp[m], "inter_cutoff")
+            Q2[k,m] = d.ist_coeff[k] * d.irr_comp[m] * oper
+        end
+    end
+
+    (H, [Q1,Q2])
+
+end
+
+# convert dcm to spherical tensor components
+function mat2sphten{T<:Real}(M::Array{T,2})
+    rank0 = -(1/sqrt(3)) * trace(M)
+    rank1 = [-(1/2)*(M[3,1]-M[1,3]-1im*((M[3,2]-M[2,3]))),
+             (1im/sqrt(2))*(M[1,2]-M[2,1]),
+             -(1/2)*(M[3,1]-M[1,3]+1im*(M[3,2]-M[2,3]))]
+    rank2 = [+(1/2)*(M[1,1]-M[2,2]-1im*(M[1,2]+M[2,1])),
+             -(1/2)*(M[1,3]+M[3,1]-1im*(M[2,3]+M[3,2])),
+             +(1/sqrt(6))*(2*M[3,3]-M[1,1]-M[2,2]),
+             +(1/2)*(M[1,3]+M[3,1]+1im*(M[2,3]+M[3,2])),
+             +(1/2)*(M[1,1]-M[2,2]+1im*(M[1,2]+M[2,1]))]
+    (rank0, rank1, rank2)
+end
+
 # compute contribution to hamiltonian from a Zeeman coupling
 # write a general descriptor which can be interpreted to the actual Hamiltonian
 function hamiltonian(sys::System, z::Zeeman)
-    nL = 0
-    opL = fill("E", 8)
-    nS = 0
-    opS = fill("E",8)
-    isotropic = zeros(Float64, 8)
-    ist_coeff = zeros(Float64, 8, 5)
-    irr_comp = zeros(Float64, 8, 5)
+    nL = zeros(Int,3)
+    opL = fill("E",3)
+    nS = zeros(Int,3)
+    opS = fill("E",3)
+    isotropic = zeros(Float64, 3)
+    ist_coeff = zeros(Float64, 3, 5)
+    irr_comp = zeros(Float64, 3, 5)
+
+    n = z.spin
 
     # isotropic part
     if z.strength in ["full", "z_full"]
@@ -384,7 +450,7 @@ function hamiltonian(sys::System, z::Zeeman)
         zeeman_iso = trace(z.matrix)/3
 
         if significant(zeeman_iso, "inter_cutoff")
-            nL = n, opL[2] = "Lz"
+            nL[2] = n; opL[2] = "Lz"
             isotropic[2] = zeeman_iso
         end
 
@@ -393,7 +459,7 @@ function hamiltonian(sys::System, z::Zeeman)
         # subtract the carrier
         zeeman_iso = trace(z.matrix)/3 - (-sys.magnet * (sys.isotopes[z.spin]).gamma)
         if significant(zeeman_iso, "inter_cutoff")
-            nL = n; opL[2] = "Lz"
+            nL[2] = n; opL[2] = "Lz"
             isotropic[2] = zeeman_iso
         end
 
@@ -401,4 +467,421 @@ function hamiltonian(sys::System, z::Zeeman)
 
     # anisotropic part
 
+    phi_zeeman = mat2sphten(z.matrix)[3]
+
+    if significant(phi_zeeman, "inter_cutoff")
+
+        for k=1:3
+            irr_comp[k,:] = phi_zeeman
+        end
+
+        if z.strength == "full"
+
+            nL[1] = n; opL[1] = "L+"; ist_coeff[1,2] = -0.5
+            nL[2] = n; opL[2] = "Lz"; ist_coeff[2,3] = sqrt(2/3)
+            nL[3] = n; opL[3] = "L-"; ist_coeff[3,4] = 0.5
+
+        elseif z.strength in ["secular", "z_full", "z_offs"]
+
+            nL[2] = n; opL[2] = "Lz"; ist_coeff[2,3] = sqrt(2/3)
+
+        elseif z.strength == "+"
+
+            nL[1] = n; opL[1] = "L+"; ist_coeff[1,2] = -0.5
+
+        elseif z.strength == "-"
+
+            nL[3] = n; opL[3] = "L-"; ist_coeff[3,4] = 0.5
+
+        end
+
+    end
+
+    mask = find(nL)
+
+    [Descriptor(nL[x],nS[x],opL[x],opS[x],isotropic[x],ist_coeff[x,:],irr_comp[x,:]) for x in mask]
+
+end
+
+# process a quadrupolar coupling
+function quad_ham(sys::System, c::Coupling)
+    nL = zeros(Int,5)
+    opL = fill("E",5)
+    nS = zeros(Int,5)
+    opS = fill("E",5)
+    isotropic = zeros(Float64, 5)
+    ist_coeff = zeros(Float64, 5, 5)
+    irr_comp = zeros(Float64, 5, 5)
+
+    n = c.spins[1]
+
+    phi_quad = mat2sphten(c.matrix)[3]
+
+    if significant(phi_quad, "inter_cutoff")
+
+        if c.strength == "strong"
+
+            nL[1] = n; opL[1] = "T2,+2"; ist_coeff[1,1] = 1
+            nL[2] = n; opL[2] = "T2,+1"; ist_coeff[2,2] = 1
+            nL[3] = n; opL[3] =  "T2,0"; ist_coeff[3,3] = 1
+            nL[4] = n; opL[4] = "T2,-1"; ist_coeff[4,4] = 1
+            nL[5] = n; opL[5] = "T2,-2"; ist_coeff[5,5] = 1
+
+        elseif c.strength in ["secular", "T2,0"]
+
+            nL[3] = n; opL[3] =  "T2,0"; ist_coeff[3,3] = 1
+
+        elseif c.strength == "T2,+2"
+
+            nL[1] = n; opL[1] = "T2,+2"; ist_coeff[1,1] = 1
+
+        elseif c.strength == "T2,-2"
+
+            nL[5] = n; opL[5] = "T2,-2"; ist_coeff[5,5] = 1
+
+        elseif c.strength == "T2,-1"
+
+            nL[4] = n; opL[4] = "T2,-1"; ist_coeff[4,4] = 1
+
+        elseif c.strength == "T2,+1"
+
+            nL[2] = n; opL[2] = "T2,+1"; ist_coeff[2,2] = 1
+
+        end
+
+    end
+
+    mask = find(nL)
+
+    [Descriptor(nL[x],nS[x],opL[x],opS[x],isotropic[x],ist_coeff[x,:],irr_comp[x,:]) for x in mask]
+
+end
+
+# process a bilinear coupling
+function bilin_ham(sys::System, c::Coupling)
+    nL = zeros(Int,3,3)
+    opL = fill("E",3,3)
+    nS = zeros(Int,3,3)
+    opS = fill("E",3,3)
+    isotropic = zeros(Float64,3,3)
+    ist_coeff = zeros(Float64,3,3,5)
+    irr_comp = zeros(Float64,3,3,5)
+
+    l = c.spins[1]; s = c.spins[2]
+
+    coupling_iso = trace(c.matrix)/3
+
+    if significant(coupling_iso, "inter_cutoff")
+
+        if c.strength in ["strong", "secular"]
+
+            nL[2,2] = l, nS[2,2] = s; opL[2,2] = "Lz"; opS[2,2] = "Lz"; isotropic[2,2] = coupling_iso
+            nL[1,3] = l, nS[1,3] = s; opL[1,3] = "L+"; opS[1,3] = "L-"; isotropic[1,3] = coupling_iso/2
+            nL[3,1] = l, nS[3,1] = s; opL[3,1] = "L-"; opS[3,1] = "L+"; isotropic[3,1] = coupling_iso/2
+
+        elseif c.strength in ["weak", "z*", "*z", "zz"]
+
+            nL[2,2] = l, nS[2,2] = s; opL[2,2] = "Lz"; opS[2,2] = "Lz"; isotropic[2,2] = coupling_iso
+
+        elseif c.strength == "+-"
+
+            nL[1,3] = l, nS[1,3] = s; opL[1,3] = "L+"; opS[1,3] = "L-"; isotropic[1,3] = coupling_iso/2
+
+        elseif c.strength == "-+"
+
+            nL[3,1] = l, nS[3,1] = s; opL[3,1] = "L-"; opS[3,1] = "L+"; isotropic[3,1] = coupling_iso/2
+
+        end
+    end
+
+    phi_coupling = mat2sphten(c.matrix)[3]
+
+    if significant(phi_coupling, "inter_cutoff")
+        for k=1:3, m=1:3
+            irr_comp[k,m,:] = phi_coupling
+        end
+
+        if c.strength == "strong"
+
+            nL[2,2] = l; nS[2,2] = s; opL[2,2] = "Lz"; opS[2,2] = "Lz"
+            ist_coeff[2,2,3] = +sqrt(2/3)
+
+            nL[1,3] = l; nS[1,3] = s; opL[1,3] = "L+"; opS[1,3] = "L-"
+            ist_coeff[1,3,3] = -sqrt(2/3)/4
+
+            nL[3,1] = l; nS[3,1] = s; opL[3,1] = "L-"; opS[3,1] = "L+"
+            ist_coeff[3,1,3] = -sqrt(2/3)/4
+
+            nL[2,1] = l; nS[2,1] = s; opL[2,1] = "Lz"; opS[2,1] = "L+"
+            ist_coeff[2,1,2] = -1/2
+
+            nL[1,2] = l; nS[1,2] = s; opL[1,2] = "L+"; opS[1,2] = "Lz"
+            ist_coeff[1,2,2] = -1/2
+
+            nL[2,3] = l; nS[2,3] = s; opL[2,3] = "Lz"; opS[2,3] = "L-"
+            ist_coeff[2,3,4] = +1/2
+
+            nL[3,2] = l; nS[3,2] = s; opL[3,2] = "L-"; opS[3,2] = "Lz"
+            ist_coeff[3,2,4] = +1/2
+
+            nL[1,1] = l; nS[1,1] = s; opL[1,1] = "L+"; opS[1,1] = "L+"
+            ist_coeff[1,1,1] = +1/2
+
+            nL[3,3] = l; nS[3,3] = s; opL[3,3] = "L-"; opS[3,3] = "L-"
+            ist_coeff[3,3,3] = +1/2
+
+        elseif c.strength == "z*"
+
+            nL[2,2] = l; nS[2,2] = s; opL[2,2] = "Lz"; opS[2,2] = "Lz"
+            ist_coeff[2,2,3] = +sqrt(2/3)
+
+            nL[2,1] = l; nS[2,1] = s; opL[2,1] = "Lz"; opS[2,1] = "L+"
+            ist_coeff[2,1,2] = -1/2
+
+            nL[2,3] = l; nS[2,3] = s; opL[2,3] = "Lz"; opS[2,3] = "L-"
+            ist_coeff[2,3,4] = +1/2
+
+        elseif c.strength == "*z"
+
+            nL[2,2] = l; nS[2,2] = s; opL[2,2] = "Lz"; opS[2,2] = "Lz"
+            ist_coeff[2,2,3] = +sqrt(2/3)
+
+            nL[1,2] = l; nS[1,2] = s; opL[1,2] = "L+"; opS[1,2] = "Lz"
+            ist_coeff[1,2,2] = -1/2
+
+            nL[3,2] = l; nS[3,2] = s; opL[3,2] = "L-"; opS[3,2] = "Lz"
+            ist_coeff[3,2,4] = +1/2
+
+        elseif c.strength in ["secular", "T2,0"]
+
+            nL[2,2] = l; nS[2,2] = s; opL[2,2] = "Lz"; opS[2,2] = "Lz"
+            ist_coeff[2,2,3] = +sqrt(2/3)
+
+            nL[1,3] = l; nS[1,3] = s; opL[1,3] = "L+"; opS[1,3] = "L-"
+            ist_coeff[1,3,3] = -sqrt(2/3)/4
+
+            nL[3,1] = l; nS[3,1] = s; opL[3,1] = "L-"; opS[3,1] = "L+"
+            ist_coeff[3,1,3] = -sqrt(2/3)/4
+
+        elseif c.strength in ["weak", "zz"]
+
+            nL[2,2] = l; nS[2,2] = s; opL[2,2] = "Lz"; opS[2,2] = "Lz"
+            ist_coeff[2,2,3] = +sqrt(2/3)
+
+        elseif c.strength == "z+"
+
+            nL[2,1] = l; nS[2,1] = s; opL[2,1] = "Lz"; opS[2,1] = "L+"
+            ist_coeff[2,1,2] = -1/2
+
+        elseif c.strength == "+z"
+
+            nL[1,2] = l; nS[1,2] = s; opL[1,2] = "L+"; opS[1,2] = "Lz"
+            ist_coeff[1,2,2] = -1/2
+
+        elseif c.strength == "T2,+1"
+
+            nL[2,1] = l; nS[2,1] = s; opL[2,1] = "Lz"; opS[2,1] = "L+"
+            ist_coeff[2,1,2] = -1/2
+
+            nL[1,2] = l; nS[1,2] = s; opL[1,2] = "L+"; opS[1,2] = "Lz"
+            ist_coeff[1,2,2] = -1/2
+
+        elseif c.strength == "z-"
+
+            nL[2,3] = l; nS[2,3] = s; opL[2,3] = "Lz"; opS[2,3] = "L-"
+            ist_coeff[2,3,4] = +1/2
+
+        elseif c.strength == "-z"
+
+            nL[3,2] = l; nS[3,2] = s; opL[3,2] = "L-"; opS[3,2] = "Lz"
+            ist_coeff[3,2,4] = +1/2
+
+        elseif c.strength == "T2,-1"
+
+            nL[2,3] = l; nS[2,3] = s; opL[2,3] = "Lz"; opS[2,3] = "L-"
+            ist_coeff[2,3,4] = +1/2
+
+            nL[3,2] = l; nS[3,2] = s; opL[3,2] = "L-"; opS[3,2] = "Lz"
+            ist_coeff[3,2,4] = +1/2
+
+        elseif c.strength == "+-"
+
+            nL[1,3] = l; nS[1,3] = s; opL[1,3] = "L+"; opS[1,3] = "L-"
+            ist_coeff[1,3,3] = -sqrt(2/3)/4
+
+        elseif c.strength == "-+"
+
+            nL[3,1] = l; nS[3,1] = s; opL[3,1] = "L-"; opS[3,1] = "L+"
+            ist_coeff[3,1,3] = -sqrt(2/3)/4
+
+        elseif c.strength in ["++", "T2,+2"]
+
+            nL[1,1] = l; nS[1,1] = s; opL[1,1] = "L+"; opS[1,1] = "L+"
+            ist_coeff[1,1,1] = +1/2
+
+        elseif c.strength in ["--", "T2,-2"]
+
+            nL[3,3] = l; nS[3,3] = s; opL[3,3] = "L-"; opS[3,3] = "L-"
+            ist_coeff[3,3,3] = +1/2
+
+        end
+    end
+
+    # reshape everything so it's easier to sort through
+    nL = reshape(nL, 9)
+    nS = reshape(nS, 9)
+    opL = reshape(opL, 9)
+    opS = reshape(opS, 9)
+    isotropic = reshape(isotropic, 9)
+    ist_coeff = reshape(ist_coeff, 9,5)
+    irr_comp = reshape(irr_comp, 9, 5)
+
+    mask = find(nL)
+
+    [Descriptor(nL[x],nS[x],opL[x],opS[x],isotropic[x],ist_coeff[x,:],irr_comp[x,:]) for x in mask]
+
+end
+
+# process a coupling
+function hamiltonian(sys::System, c::Coupling)
+    # decide if it's a quadrupolar coupling
+    if c.spins[1] == c.spins[2]
+        answer = quad_ham(sys, c)
+    else                        # it's a bilinear coupling
+        answer = bilin_ham(sys, c)
+    end
+    answer
+end
+
+function cleanup!(sys::System)
+
+    # easy access
+    nspins = length(sys.isotopes)
+
+    # check what the user provided
+    provided = [x.spin for x in sys.zeeman]
+    # make sure no duplicates
+    if length(union(provided)) != length(provided)
+        error("multiple zeeman interactions on a single spin.")
+    end
+
+    # for spins which haven't been explicitly given a Zeeman
+    for n=1:nspins
+        if !any(provided .== n)
+            push!(sys.zeeman, Zeeman(n,0))
+        end
+    end
+
+    # scale zeeman terms as needed, and keep terms for scaling dipolar interactions.
+    ddscal = fill(eye(3), nspins)
+    for i=1:length(sys.zeeman)
+        ddscal[i] = ddscal!(sys.isotopes[i], sys.zeeman[i], sys.magnet)
+    end
+
+    @show ddscal
+
+    # check provided coordinates
+    provided = [x.spin for x in sys.coords]
+    # make sure no duplicates
+    if length(union(provided)) != length(provided)
+        error("multiple coordinates provided for a single spin.")
+    end
+
+    for i=1:length(provided)
+        for j=(i+1):length(provided)
+            push!(sys.couplings, dipolar(sys.isotopes[provided[i]], sys.isotopes[provided[j]], sys.coords[i], sys.coords[j], ddscal[provided[i]], ddscal[provided[j]]))
+        end
+    end
+end
+
+function assume!(sys::System, assumptions::String)
+    if assumptions == "nmr"
+
+        # all zeeman interactions should be secular
+        for x in sys.zeeman
+            x.strength = "secular"
+        end
+
+        # couplings
+        for x in sys.couplings
+            if sys.isotopes[x.spins[1]].label == sys.isotopes[x.spins[2]].label
+                x.strength = "secular"
+            else                # heteronuclear
+                x.strength = "weak"
+            end
+        end
+
+    elseif assumptions in ["esr", "deer"]
+
+        for x in sys.zeeman
+
+            if sys.isotopes[x.spin].label == "E"
+                x.strength = "secular"
+            else
+                x.strength = "full"
+            end
+
+        end
+
+        for x in sys.couplings
+
+            if (sys.isotopes[x.spins[1]] == "E") && (sys.isotopes[x.spins[2]] != "E")
+
+                x.strength = "z*"
+
+            elseif (sys.isotopes[x.spins[1]] != "E") && (sys.isotopes[x.spins[2]] == "E")
+
+                x.strength = "*z"
+
+            elseif (sys.isotopes[x.spins[1]] == "E") && (sys.isotopes[x.spins[2]] == "E")
+
+                x.strength = "secular"
+
+            else
+
+                x.strength = "strong"
+
+            end
+        end
+
+    elseif assumptions == "labframe"
+
+        for x in sys.zeeman
+            x.strength = "full"
+        end
+        for x in sys.couplings
+            x.strength = "strong"
+        end
+    end
+end
+
+function hamiltonian!(sys::System, assumption::String, operator_type::String="comm")
+    assume!(sys, assumption)
+
+    D = Vector{Descriptor}()
+
+    for x in sys.zeeman
+        push!(D, hamiltonian(sys, x)...)
+    end
+
+    for x in sys.couplings
+        push!(D, hamiltonian(sys, x)...)
+    end
+
+    if length(D) == 0
+        H = zeros(sys)
+        Q1 = fill(zeros(sys),3,3)
+        Q2 = fill(zeros(sys),5,5)
+    else
+        local_hamiltonians = pmap(x->hamiltonian(sys, x, operator_type), D)
+        (H,(Q1,Q2)) = local_hamiltonians[1]
+        for n=2:length(local_hamiltonians)
+            H += local_hamiltonians[n][1]
+            broadcast!(+,Q1,Q1,local_hamiltonians[n][2][1])
+            broadcast!(+,Q2,Q2,local_hamiltonians[n][2][2])
+        end
+
+    end
+
+    (H,[Q1,Q2])
 end
