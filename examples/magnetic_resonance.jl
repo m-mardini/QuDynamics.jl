@@ -8,7 +8,8 @@ Base.size,
 Base.getindex,
 Base.promote_rule,
 Base.convert,
-Base.zeros
+Base.zeros,
+Base.eye
 
 """
 A library of spin values (S = j/2) and gyromagnetic ratios (rad/s).
@@ -255,6 +256,16 @@ function zeros(sys::System)
     b = basis(sys)
     m = length(b)
     answer = QuArray(spzeros(m,m), (b,b))
+    if sys.formalism == "Liouville"
+        answer = hilb2liouv(sys, answer, "left")
+    end
+    answer
+end
+
+function eye(sys::System)
+    b = basis(sys)
+    m = length(b)
+    answer = QuArray(speye(m),(b,b))
     if sys.formalism == "Liouville"
         answer = hilb2liouv(sys, answer, "left")
     end
@@ -885,3 +896,5 @@ function hamiltonian!(sys::System, assumption::String, operator_type::String="co
 
     (H,[Q1,Q2])
 end
+
+
